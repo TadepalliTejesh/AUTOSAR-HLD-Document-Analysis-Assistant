@@ -28,11 +28,34 @@ def extract_document_acronyms(all_chunks: List[Dict[str, Any]]) -> Dict[str, str
     return acronym_map
 
 
+COMPOUND_PREFIXES = ("micro", "multi", "electro", "tele", "nano", "opto", "cyber", "inter", "intra")
+
+
+def get_stem(w: str) -> str:
+    """Extracts morphological root of an English word with prefix/suffix stripping."""
+    w = w.lower().strip()
+    w = re.sub(r'^(?:sub|super|inter|intra|multi|pre|post|re)', '', w)
+    for _ in range(2):
+        w = re.sub(r'(?:ing|ed|es|s|ence|ance|ent|ant|tion|sion|ic|al|ly|ability|ibility|ive|or|er)$', '', w)
+    return w
+
+
+def matches_token(w: str, text: str) -> bool:
+    """Checks exact match or morphological root match in text."""
+    if w in text:
+        return True
+    st = get_stem(w)
+    if len(st) >= 4 and st in text:
+        return True
+    return False
+
+
 def check_entity_match(ent: str, text: str, acronym_map: Optional[Dict[str, str]] = None) -> float:
     """
     Dynamically scores how well an entity matches candidate text:
     - 1.0: Exact word match, normalized hyphen match, or full acronym expansion match.
-    - 0.85: Dynamic initialism / prefix match for acronym entities.
+    - 0.95: Exact initialism match (with scientific compound prefix splitting).
+    - 0.85 / 0.60: Strong prefix match for acronym entities.
     - 0.50: Partial multi-word match.
     - 0.0: No match.
     """
@@ -48,15 +71,17 @@ def check_entity_match(ent: str, text: str, acronym_map: Optional[Dict[str, str]
     if re.search(r'\b' + re.escape(ent_lower) + r'\b', text_lower):
         return 1.0
 
-    # Normalized hyphens, colons, slashes, and underscores (e.g. 'ara::exec' matches 'ara exec')
-    norm_text = re.sub(r'[:/.\-\s_]+', ' ', text_lower)
+    # Normalized hyphens, Greek micro, colons, slashes, and underscores
+    norm_text = re.sub(r'[\u00b5\u03bc]c\b', 'microcontroller', text_lower)
+    norm_text = re.sub(r'[\u00b5\u03bc]', 'micro', norm_text)
+    norm_text = re.sub(r'[:/.\-\s_]+', ' ', norm_text)
     norm_ent = re.sub(r'[:/.\-\s_]+', ' ', ent_lower)
     if norm_ent in norm_text:
         return 1.0
 
     # Multi-word entity: all substantive words present
-    ent_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', ent_lower) if w not in STOP_WORDS]
-    if len(ent_words) > 1 and all(w in norm_text for w in ent_words):
+    ent_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', norm_ent) if w not in STOP_WORDS]
+    if len(ent_words) > 1 and all(w in norm_text or matches_token(w, norm_text) for w in ent_words):
         return 1.0
 
     # Acronym map expansion (learned dynamically from document)
@@ -65,18 +90,38 @@ def check_entity_match(ent: str, text: str, acronym_map: Optional[Dict[str, str]
         if expansion in norm_text or all(w in norm_text for w in expansion.split() if w not in STOP_WORDS):
             return 1.0
 
-    # Initialism / prefix matching for acronym entities (2-6 letters)
+    # Initialism / acronym matching with scientific compound prefix splitting (e.g. Microcontroller -> micro + controller -> m + c)
     if 2 <= len(ent_lower) <= 6 and ent_lower.isalpha():
-        words = [w for w in re.findall(r'\b[a-zA-Z]{2,}\b', norm_text) if w not in STOP_WORDS]
-        for n in range(2, min(len(ent_lower) + 2, 7)):
+        raw_words = [w for w in re.findall(r'\b[a-zA-Z]{2,}\b', norm_text) if w not in STOP_WORDS]
+        words = []
+        for w in raw_words:
+            split_done = False
+            for pfx in COMPOUND_PREFIXES:
+                if w.startswith(pfx) and len(w) > len(pfx) + 2:
+                    words.extend([pfx, w[len(pfx):]])
+                    split_done = True
+                    break
+            if not split_done:
+                words.append(w)
+
+        # First pass: exact initialism match
+        for n in range(2, len(words) + 1):
             for i in range(len(words) - n + 1):
                 initials = "".join(w[0] for w in words[i:i+n])
-                if initials == ent_lower or (ent_lower.startswith(initials) and len(initials) >= 2):
-                    return 0.85
+                if initials == ent_lower:
+                    return 0.95
+
+        # Second pass: strong prefix match (at least 3 letters, matching prefix of length >= len(ent)-1)
+        if len(ent_lower) >= 4:
+            for n in range(3, len(words) + 1):
+                for i in range(len(words) - n + 1):
+                    initials = "".join(w[0] for w in words[i:i+n])
+                    if len(initials) >= len(ent_lower) - 1 and ent_lower.startswith(initials):
+                        return 0.60
 
     # Partial word match for multi-word phrases (proportional to matched content words)
     if ent_words:
-        matched_ent_words = sum(1 for w in ent_words if w in norm_text and len(w) > 2)
+        matched_ent_words = sum(1 for w in ent_words if (w in norm_text or matches_token(w, norm_text)) and len(w) > 2)
         match_ratio = matched_ent_words / len(ent_words)
         if match_ratio >= 0.66:
             return 0.50
@@ -113,9 +158,17 @@ def evaluate_confidence(
 
 
 class RetrieverService:
-    def __init__(self, top_k: int = 5, min_relevance: float = 0.58):
+    def __init__(
+        self,
+        top_k: int = 5,
+        min_relevance: float = 0.58,
+        vector_store: Optional[Any] = None,
+        embedding_svc: Optional[Any] = None
+    ):
         self.top_k = top_k
         self.min_relevance = min_relevance
+        self.vector_store = vector_store or vector_store_service
+        self.embedding_svc = embedding_svc or embedding_service
 
     def retrieve(
         self,
@@ -135,7 +188,7 @@ class RetrieverService:
         entities_lower = [e.lower().strip() for e in entities if e and e.strip()]
 
         # 1. Fetch all chunks for this isolated document to enable hybrid lexical indexing
-        all_chunks = vector_store_service.get_all_chunks(document_id)
+        all_chunks = self.vector_store.get_all_chunks(document_id)
         if not all_chunks:
             return [], "Insufficient", 0.0, "No chunks found in document index."
 
@@ -173,8 +226,8 @@ class RetrieverService:
         acronym_map = extract_document_acronyms(all_chunks)
 
         # 3. Dense Semantic Retrieval across the whole document
-        query_emb = embedding_service.embed_text(clean_query)
-        dense_candidates = vector_store_service.search(
+        query_emb = self.embedding_svc.embed_text(clean_query)
+        dense_candidates = self.vector_store.search(
             document_id=document_id,
             query_embedding=query_emb,
             top_k=len(all_chunks)
@@ -206,7 +259,7 @@ class RetrieverService:
             norm_sec = re.sub(r'[\-–—_/:]+', ' ', section_lower)
 
             # a. Section / Title Relevance
-            sec_word_matches = sum(1 for w in distinctive_words if w in norm_sec)
+            sec_word_matches = sum(1 for w in distinctive_words if matches_token(w, norm_sec))
             sec_unigram_ratio = sec_word_matches / max(len(distinctive_words), 1)
 
             phrase_in_sec = any(
@@ -219,6 +272,22 @@ class RetrieverService:
             sec_relevance = sec_unigram_ratio
             if phrase_in_sec:
                 sec_relevance = max(sec_relevance, 0.50 + 0.45 * sec_unigram_ratio)
+
+            # Canonical section matching: does section title match or start/end with an entity?
+            canonical_sec_match = False
+            target_ent = classification.get("target", "").lower().strip()
+            candidates_to_check = entities_lower + ([target_ent] if target_ent else [])
+            for ent in candidates_to_check:
+                if not ent or ent in STOP_WORDS:
+                    continue
+                m = check_entity_match(ent, section_lower, acronym_map)
+                norm_e = re.sub(r'[:/.\-\s_]+', ' ', ent)
+                if m >= 0.85 or norm_sec.strip() == norm_e or norm_sec.startswith(norm_e + " ") or norm_sec.endswith(" " + norm_e):
+                    canonical_sec_match = True
+                    break
+
+            if canonical_sec_match:
+                sec_relevance = max(sec_relevance, 0.95)
 
             if entities_lower and len(entities_lower) >= 2:
                 sec_ent_matches = sum(1 for e in entities_lower if check_entity_match(e, section_lower, acronym_map) >= 0.5)
@@ -233,16 +302,16 @@ class RetrieverService:
             entity_coverage = (covered_count / len(entities_lower)) if entities_lower else 1.0
 
             # c. High-Precision Lexical & Phrase Matching
-            matched_words = sum(1 for w in distinctive_words if w in combined_text or w in norm_combined)
+            matched_words = sum(1 for w in distinctive_words if matches_token(w, combined_text) or matches_token(w, norm_combined))
             unigram_overlap = matched_words / max(len(distinctive_words), 1)
 
             phrase_match_score = 0.0
             longest_matching_phrase = 0
             for term in search_terms:
-                term_words = term.split()
-                if len(term_words) > 1 and (term in combined_text or term in norm_combined):
+                substantive_tokens = [w for w in term.split() if w not in STOP_WORDS]
+                if len(substantive_tokens) > 1 and (term in combined_text or term in norm_combined):
                     phrase_match_score += 0.35
-                    longest_matching_phrase = max(longest_matching_phrase, len(term_words))
+                    longest_matching_phrase = max(longest_matching_phrase, len(substantive_tokens))
 
             phrase_match_score = min(1.0, phrase_match_score)
             lex_score = max(unigram_overlap, 0.40 * unigram_overlap + 0.60 * phrase_match_score)
@@ -258,12 +327,11 @@ class RetrieverService:
 
             # Target Entity Focus: For queries asking about a specific target entity,
             # prioritize chunks containing that entity and prevent off-target chunks from being boosted by background words.
-            target_ent = classification.get("target", "").lower().strip()
             if target_ent and len(target_ent) >= 2 and target_ent not in STOP_WORDS:
                 target_m = check_entity_match(target_ent, combined_text, acronym_map)
                 if target_m >= 0.5:
                     intent_boost += 0.35
-                elif target_m < 0.25:
+                elif target_m < 0.25 and intent not in (QueryIntent.MULTI_HOP_FLOW, QueryIntent.DOCUMENT_PURPOSE):
                     intent_boost -= 0.40
                     phrase_boost = 0.0
 
@@ -284,6 +352,16 @@ class RetrieverService:
             if has_entity_label:
                 intent_boost += 0.35
 
+            # Document Purpose Intent
+            if intent == QueryIntent.DOCUMENT_PURPOSE:
+                is_doc_purpose_sec = any(w in section_lower for w in ["purpose", "purpose and inputs", "inputs", "scope", "introduction", "document overview"])
+                has_purpose_content = any(w in content_lower for w in ["purpose of this document", "purpose of the document", "describes the", "forms the base", "scope of this document"])
+                if is_doc_purpose_sec or has_purpose_content:
+                    sec_relevance = max(sec_relevance, 0.95)
+                    intent_boost += 0.50
+                if any(w in section_lower for w in ["example of a layered", "release history", "revision"]):
+                    intent_boost -= 0.50
+
             # Architecture view vs Development/Process view affinity
             ARCH_VIEW_KEYWORDS = ["logical view", "architecture", "layered architecture", "layers", "components", "structural view", "component view", "distribution", "interfaces"]
             PROCESS_VIEW_KEYWORDS = ["stage", "stages", "development approach", "workflow", "process", "lifecycle", "phases", "steps", "methodology"]
@@ -291,7 +369,7 @@ class RetrieverService:
             query_has_arch_view = any(w in clean_query.lower() for w in ARCH_VIEW_KEYWORDS)
             query_has_process_view = any(w in clean_query.lower() for w in PROCESS_VIEW_KEYWORDS)
 
-            if query_has_arch_view and not query_has_process_view:
+            if query_has_arch_view and not query_has_process_view and intent not in (QueryIntent.DOCUMENT_PURPOSE, QueryIntent.MULTI_HOP_FLOW):
                 if any(w in section_lower for w in ["logical view", "layered software architecture", "layered architecture"]):
                     sec_relevance = max(sec_relevance, 0.95)
                     intent_boost += 0.35
@@ -336,6 +414,8 @@ class RetrieverService:
                         intent_boost += 0.25
                 if any(w in section_lower for w in ["architecture", "overview", "system", "principles", "approach", "logical view"]):
                     intent_boost += 0.25
+                if any(w in section_lower for w in ["document overview", "history", "changelog", "release notes"]):
+                    intent_boost -= 0.35
 
             elif intent == QueryIntent.STRUCTURE_COMPONENTS:
                 has_benefit = any(w in section_lower for w in ["benefit", "benefits", "advantage", "advantages", "why use"])
@@ -360,12 +440,39 @@ class RetrieverService:
                     intent_boost += 0.35
                 elif entity_coverage >= 0.45:
                     intent_boost += 0.18
+                if canonical_sec_match:
+                    intent_boost += 0.40
+
+            elif intent == QueryIntent.MULTI_HOP_FLOW:
+                source_ent = classification.get("source", "").lower().strip()
+                target_ent = classification.get("target", "").lower().strip()
+                m_src = check_entity_match(source_ent, combined_text, acronym_map) if source_ent else 0.0
+                m_tgt = check_entity_match(target_ent, combined_text, acronym_map) if target_ent else 0.0
+                BRIDGE_CUES = [
+                    "runtime environment", "rte", "ecu abstraction", "hardware abstraction",
+                    "microcontroller abstraction", "mcal", "driver", "drivers", "i/o hw abstraction",
+                    "basic software", "bsw", "abstraction layer", "sensor/actuator", "microcontroller"
+                ]
+                is_bridge = any(cue in combined_text for cue in BRIDGE_CUES)
+                is_stack_table = "table" in chunk.get("source_type", "").lower() or ("|" in chunk["content"] and "layer" in combined_text)
+                if m_src >= 0.4:
+                    intent_boost += 0.40
+                if m_tgt >= 0.4:
+                    intent_boost += 0.40
+                if is_bridge:
+                    intent_boost += 0.40
+                    entity_coverage = max(entity_coverage, 0.75)
+                if is_stack_table:
+                    intent_boost += 0.30
 
             elif intent == QueryIntent.LIST_MULTI_PART:
                 if sec_relevance >= 0.40:
                     intent_boost += 0.35
-                if any(cue in combined_text for cue in ["1.", "2.", "•", "-", "->", "→", "|", "stage", "class", "step", "category", "phase", "type", "level"]):
-                    intent_boost += 0.15
+                has_division_stmt = bool(re.search(r'(?i)\b(?:divided|subdivided|subdivision|divided in the layers)\b', combined_text))
+                if has_division_stmt:
+                    intent_boost += 0.40
+                elif any(cue in combined_text for cue in ["1.", "2.", "•", "-", "->", "→", "|", "stage", "class", "step", "category", "phase", "type", "level", "layer"]):
+                    intent_boost += 0.20
 
             elif intent == QueryIntent.PROCESS_WORKFLOW:
                 if any(cue in combined_text for cue in ["workflow", "process", "steps", "procedure", "flow", "pipeline"]):
@@ -381,7 +488,8 @@ class RetrieverService:
                 0.10 * sec_relevance +
                 0.10 * intent_boost +
                 phrase_boost +
-                label_boost
+                label_boost +
+                (0.40 if canonical_sec_match else 0.0)
             )
             if is_toc:
                 hybrid_score -= 0.35
@@ -401,10 +509,58 @@ class RetrieverService:
         # 5. Greedy Diversity & Coverage Selection
         filtered_chunks = []
         seen_ids = set()
-        covered_ents = set()
 
-        top_score = scored_candidates[0]["hybrid_score"]
-        for c in scored_candidates[:15]:
+        # 1. COMPARISON: guarantee top defining chunk for each compared entity across all chunks
+        if intent == QueryIntent.COMPARISON and entities_lower and len(entities_lower) >= 2:
+            for ent in entities_lower:
+                best_cand = None
+                best_score = -1.0
+                for c in scored_candidates:
+                    c_sec = c["section"].lower().strip()
+                    c_cnt = c["content"].lower()
+                    c_comb = c_sec + " " + c_cnt
+                    m_comb = check_entity_match(ent, c_comb, acronym_map)
+                    m_sec = check_entity_match(ent, c_sec, acronym_map)
+                    if m_comb >= 0.5:
+                        is_exact_sec = (c_sec == ent or re.sub(r'[:/.\-\s_]+', ' ', c_sec).strip() == ent)
+                        score = c["hybrid_score"] + (0.75 if is_exact_sec else (0.35 if m_sec >= 0.85 else 0.0))
+                        if score > best_score:
+                            best_cand = c
+                            best_score = score
+                if best_cand and best_cand["chunk_id"] not in seen_ids:
+                    filtered_chunks.append(best_cand)
+                    seen_ids.add(best_cand["chunk_id"])
+
+        # 2. MULTI_HOP_FLOW: select diverse layers along the stack
+        elif intent == QueryIntent.MULTI_HOP_FLOW:
+            layer_specs = [
+                ("app", ["application layer", "sensor/actuator", "software component"]),
+                ("rte", ["runtime environment", "rte"]),
+                ("ecu_abs", ["ecu abstraction", "hardware abstraction", "i/o hw abstraction"]),
+                ("mcal", ["microcontroller abstraction", "mcal"]),
+                ("complex_drivers", ["complex driver", "complex drivers"])
+            ]
+            for layer_key, layer_terms in layer_specs:
+                best_layer_chunk = None
+                best_layer_score = -1.0
+                for c in scored_candidates:
+                    c_sec = c["section"].lower()
+                    c_cnt = c["content"].lower()
+                    matches_layer = any(t in c_sec or t in c_cnt for t in layer_terms)
+                    if matches_layer:
+                        sec_matches = any(t in c_sec for t in layer_terms)
+                        score = c["hybrid_score"] + (0.70 if sec_matches else 0.0)
+                        if score > best_layer_score:
+                            best_layer_chunk = c
+                            best_layer_score = score
+                if best_layer_chunk and best_layer_chunk["chunk_id"] not in seen_ids:
+                    filtered_chunks.append(best_layer_chunk)
+                    seen_ids.add(best_layer_chunk["chunk_id"])
+
+        # Top-k fill / general greedy diversity
+        top_score = scored_candidates[0]["hybrid_score"] if scored_candidates else 1.0
+        covered_ents = set()
+        for c in scored_candidates[:20]:
             if len(filtered_chunks) >= self.top_k:
                 break
             cid = c["chunk_id"]

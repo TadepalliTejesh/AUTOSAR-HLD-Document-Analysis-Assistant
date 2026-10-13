@@ -149,11 +149,34 @@ def score_intent_alignment(
     # 4. Comparison Intent
     elif intent == QueryIntent.COMPARISON:
         if len(entities) >= 2:
-            matches = sum(1 for e in entities[:2] if check_entity_match(e, combined, acronym_map) > 0.4)
-            if matches >= 2:
+            matches = sum(1 for e in entities if check_entity_match(e, combined, acronym_map) > 0.4)
+            is_canonical_def = any(check_entity_match(e, sec_lower, acronym_map) >= 0.85 for e in entities)
+            if is_canonical_def:
                 return 1.0
+            if matches >= 2:
+                return 0.95
             elif matches == 1:
                 return 0.70
+        return 0.50
+
+    # 4b. Document Purpose Intent
+    elif intent == QueryIntent.DOCUMENT_PURPOSE:
+        is_doc_purpose_sec = any(w in sec_lower for w in ["purpose", "purpose and inputs", "inputs", "scope", "introduction", "document overview"])
+        has_purpose_content = any(w in text_lower for w in ["purpose of this document", "purpose of the document", "describes the", "forms the base", "scope of this document"])
+        if is_doc_purpose_sec and has_purpose_content:
+            return 1.0
+        elif is_doc_purpose_sec or has_purpose_content:
+            return 0.85
+        if any(w in sec_lower for w in ["example of a layered", "release history", "revision"]):
+            return 0.15
+        return 0.35
+
+    # 4c. Multi-Hop Flow Intent
+    elif intent == QueryIntent.MULTI_HOP_FLOW:
+        has_flow_cues = any(w in combined for w in ["path", "flow", "layer", "situated", "interfaces", "abstracts", "between", "access", "hierarchical", "top view", "hardware abstraction", "component style"])
+        is_stack_diag = "table" in cleaned.lower() or "|" in cleaned or any(w in sec_lower for w in ["top view", "runtime environment", "rte", "abstraction", "drivers"])
+        if has_flow_cues or is_stack_diag:
+            return 0.95
         return 0.50
 
     # 5. Mechanism / How It Works Intent
@@ -203,9 +226,10 @@ def score_intent_alignment(
 
     # 8. List / Multi-Part Intent
     elif intent == QueryIntent.LIST_MULTI_PART:
+        has_division = bool(re.search(r'(?i)\b(?:divided|subdivided|subdivision|divided in the layers)\b', combined))
         has_cat = any(w in combined for w in ["categories", "classes", "types", "groups", "drivers", "layers", "scalability", "stages"])
         has_bullets = bool(re.search(r"^[\-–—•\*\d]\s+[A-Z]", cleaned, re.MULTILINE))
-        if has_cat or has_bullets:
+        if has_division or has_cat or has_bullets:
             return 0.95
         return 0.50
 
@@ -223,9 +247,12 @@ def score_intent_alignment(
 
 
 def get_word_root(w: str) -> str:
-    """Gets generic morphological root / stem of an English word."""
+    """Gets generic morphological root / stem of an English word with prefix and suffix stripping."""
     w_clean = w.lower().strip()
-    return re.sub(r'(?:ing|ed|es|s|ence|ance|ent|ant|tion|sion|ic|al|ly|ability|ibility)$', '', w_clean)
+    w_clean = re.sub(r'^(?:sub|super|inter|intra|multi|pre|post|re)', '', w_clean)
+    for _ in range(2):
+        w_clean = re.sub(r'(?:ing|ed|es|s|ence|ance|ent|ant|tion|sion|ic|al|ly|ability|ibility|ive|or|er)$', '', w_clean)
+    return w_clean
 
 
 def is_word_in_text(w: str, text: str) -> bool:
@@ -372,8 +399,12 @@ def evaluate_evidence_confidence(
         0.10 * (1.0 - min(noise_ratio, 1.0))
     )
 
-    if composite_score >= 0.70 and intent_alignment >= 0.70 and entity_coverage >= 0.65:
-        confidence = "High"
+    if composite_score >= 0.70 and intent_alignment >= 0.70 and entity_coverage >= 0.65 and semantic_sim >= 0.72:
+        # Multi-hop flows synthesized across multiple distinct pages without a single primary end-to-end chunk
+        if intent == QueryIntent.MULTI_HOP_FLOW and len({c.get("page") for c in supporting_chunks}) > 1 and semantic_sim < 0.76:
+            confidence = "Medium"
+        else:
+            confidence = "High"
     elif composite_score >= 0.48 and intent_alignment >= 0.40:
         confidence = "Medium"
     elif composite_score < 0.35 or entity_coverage < 0.30:
@@ -465,9 +496,9 @@ def prune_and_rank_supporting_evidence(
         # 6. Exact Multi-Word Phrase Boost
         longest_matching_phrase = 0
         for term in classification.get("search_terms", []):
-            term_words = term.split()
-            if len(term_words) > 1 and term in combined_text:
-                longest_matching_phrase = max(longest_matching_phrase, len(term_words))
+            substantive_tokens = [w for w in term.split() if w not in STOP_WORDS]
+            if len(substantive_tokens) > 1 and term in combined_text:
+                longest_matching_phrase = max(longest_matching_phrase, len(substantive_tokens))
 
         phrase_boost = 0.30 if longest_matching_phrase >= 3 else (0.15 if longest_matching_phrase == 2 else 0.0)
 
@@ -493,6 +524,7 @@ def prune_and_rank_supporting_evidence(
         c_copy["content"] = cleaned_content
         c_copy["support_score"] = support_score
         c_copy["intent_alignment"] = intent_align
+        c_copy["word_overlap"] = word_overlap
         scored.append(c_copy)
 
     scored.sort(key=lambda x: x["support_score"], reverse=True)
@@ -526,23 +558,32 @@ def prune_and_rank_supporting_evidence(
         # Multi-page or multi-aspect evidence required (e.g. comparison or multi-entity query)
         supporting = [top_chunk]
         top_comb = top_chunk.get("section", "").lower() + " " + top_chunk["content"].lower()
+        max_chunks_allowed = 4 if intent == QueryIntent.MULTI_HOP_FLOW else 3
         for c in scored[1:]:
-            if len(supporting) >= 3:
+            if len(supporting) >= max_chunks_allowed:
                 break
             c_comb = c.get("section", "").lower() + " " + c["content"].lower()
 
-            # Check if c provides novel entity coverage not covered by top_chunk
+            # Check if c provides novel entity coverage not covered by existing supporting chunks
             has_novel_entity = False
             if entities:
                 for e in entities:
-                    if check_entity_match(e, top_comb, acronym_map) < 0.40 and check_entity_match(e, c_comb, acronym_map) >= 0.45:
+                    already_covered = any(check_entity_match(e, s.get("section", "") + " " + s["content"], acronym_map) >= 0.50 for s in supporting)
+                    if not already_covered and check_entity_match(e, c_comb, acronym_map) >= 0.50:
                         has_novel_entity = True
                         break
+
+            # Multi-hop flow layer expansion (different layer along the architectural path)
+            is_flow_layer = (
+                intent == QueryIntent.MULTI_HOP_FLOW
+                and c.get("page") != top_chunk.get("page")
+                and any(t in c.get("section", "").lower() for t in ["runtime environment", "rte", "ecu abstraction", "hardware abstraction", "microcontroller abstraction", "mcal"])
+            )
 
             # Multi-part list or transformation workflow expansion
             is_multi_part_expansion = (
                 intent in {QueryIntent.LIST_MULTI_PART, QueryIntent.TRANSFORMATION_WORKFLOW, QueryIntent.COMPARISON, QueryIntent.MULTI_HOP_FLOW}
-                and c["support_score"] >= top_score * 0.75
+                and c["support_score"] >= top_score * 0.70
                 and c["intent_alignment"] >= 0.45
             )
 
@@ -568,7 +609,7 @@ def prune_and_rank_supporting_evidence(
                             has_conflicting_heading = True
                             break
 
-            if (has_novel_entity or is_multi_part_expansion or is_same_page_section) and not has_conflicting_heading:
+            if (has_novel_entity or is_flow_layer or is_multi_part_expansion or is_same_page_section) and not has_conflicting_heading:
                 supporting.append(c)
 
     confidence, metrics = evaluate_evidence_confidence(
@@ -586,15 +627,22 @@ def prune_and_rank_supporting_evidence(
 
 def validate_citations_against_answer(
     answer: str,
-    supporting_chunks: List[Dict[str, Any]]
+    supporting_chunks: List[Dict[str, Any]],
+    question: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Validates supporting chunks against the final generated answer.
     Guarantees that every cited chunk directly supports at least one substantive claim
-    in the final answer. Removes topically related but unused neighboring chunks.
+    in the final answer. Enforces evidence minimality:
+    - If one page completely supports all substantive claims, cites ONLY that page.
+    - Removes topically related but unused neighboring chunks.
+    - Excludes preambles and question echoes.
     """
     if not supporting_chunks or len(supporting_chunks) <= 1:
         return supporting_chunks
+
+    q_lower = (question or "").lower()
+    q_tokens = {w for w in re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", q_lower) if w not in STOP_WORDS and len(w) > 2}
 
     # Exclude formulaic template lines and meta-text; split by sentence boundaries and newlines
     clean_lines = [l.strip() for l in re.split(r"(?<=[.!?])\s+|\n+", answer) if l.strip()]
@@ -604,32 +652,56 @@ def validate_citations_against_answer(
         if l_lower.startswith(("based on", "according to", "answer:", "evidence:", "confidence:", "citations:", "potential inconsistency")):
             continue
         c = re.sub(r"^[•\-\*\d\.\)\s\|]+", "", l).strip()
-        if len(c) > 20:
-            claims.append(c)
+        if len(c) >= 5:
+            tokens = {w for w in re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", c.lower()) if w not in STOP_WORDS and len(w) > 2}
+            # Skip lines that are purely echoes of the question with no novel answer tokens
+            if tokens and (not q_tokens or bool(tokens - q_tokens)):
+                claims.append((c, tokens))
 
     if not claims:
         return supporting_chunks[:1]
 
-    # For each claim, find the best supporting chunk
-    best_supporting_chunk_indices = set()
-    for claim in claims:
-        claim_tokens = {w for w in re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", claim.lower()) if w not in STOP_WORDS and len(w) > 2}
-        if not claim_tokens:
-            continue
-        best_idx = -1
-        best_score = 0.0
-        for i, chunk in enumerate(supporting_chunks):
-            c_text = clean_ocr_text(chunk["content"]).lower()
-            matched = {w for w in claim_tokens if w in c_text}
+    # For each claim, calculate match score per chunk
+    claim_scores = []
+    for _, claim_tokens in claims:
+        scores = []
+        for ch in supporting_chunks:
+            c_text = clean_ocr_text(ch["content"]).lower() + " " + ch.get("section", "").lower()
+            matched = {w for w in claim_tokens if is_word_in_text(w, c_text)}
             score = len(matched) / len(claim_tokens)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        if best_idx >= 0 and best_score >= 0.35:
-            best_supporting_chunk_indices.add(best_idx)
+            scores.append(score)
+        claim_scores.append(scores)
 
-    if not best_supporting_chunk_indices:
+    # A chunk supports a claim if score >= 0.40 and within 0.15 of best score for that claim
+    chunk_supported_claims = {i: set() for i in range(len(supporting_chunks))}
+    for c_idx, scores in enumerate(claim_scores):
+        max_s = max(scores) if scores else 0.0
+        if max_s >= 0.40:
+            for i, s in enumerate(scores):
+                if s >= max_s - 0.15 and s >= 0.40:
+                    chunk_supported_claims[i].add(c_idx)
+
+    # Greedy set cover: prioritize chunks that cover the most claims (minimum sufficient evidence set)
+    uncovered = set(range(len(claims)))
+    selected_indices = []
+    while uncovered:
+        best_i = -1
+        best_gain = 0
+        for i in range(len(supporting_chunks)):
+            if i in selected_indices:
+                continue
+            gain = len(chunk_supported_claims[i] & uncovered)
+            if gain > best_gain or (gain == best_gain and gain > 0 and len(chunk_supported_claims[i]) > len(chunk_supported_claims.get(best_i, set()))):
+                best_gain = gain
+                best_i = i
+        if best_i >= 0 and best_gain > 0:
+            selected_indices.append(best_i)
+            uncovered -= chunk_supported_claims[best_i]
+        else:
+            break
+
+    if not selected_indices:
         return supporting_chunks[:1]
 
-    return [supporting_chunks[i] for i in sorted(best_supporting_chunk_indices)]
+    return [supporting_chunks[i] for i in sorted(selected_indices)]
 

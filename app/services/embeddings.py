@@ -1,26 +1,36 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 import numpy as np
 from app.core.config import settings
 from app.core.logging import logger
 
 
 class EmbeddingService:
+    _instances: Dict[str, "EmbeddingService"] = {}
     _instance: Optional["EmbeddingService"] = None
     _model = None
+    _model_name: str = ""
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(EmbeddingService, cls).__new__(cls)
-            cls._instance._init_model()
-        return cls._instance
+    def __new__(cls, model_name: Optional[str] = None):
+        target_model = model_name or settings.EMBEDDING_MODEL
+        if target_model not in cls._instances:
+            instance = super(EmbeddingService, cls).__new__(cls)
+            instance._model_name = target_model
+            instance._init_model(target_model)
+            cls._instances[target_model] = instance
+            if target_model == settings.EMBEDDING_MODEL:
+                cls._instance = instance
+        return cls._instances[target_model]
 
-    def _init_model(self):
-        model_name = settings.EMBEDDING_MODEL
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def _init_model(self, model_name: str):
         logger.info(f"Loading SentenceTransformer embedding model: {model_name}")
         try:
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(model_name)
-            logger.info("Embedding model loaded successfully.")
+            logger.info(f"Embedding model ({model_name}) loaded successfully.")
         except Exception as e:
             logger.error(f"Failed to load SentenceTransformer ({model_name}): {e}. Using deterministic fallback.")
             self._model = None
@@ -58,3 +68,8 @@ class EmbeddingService:
 
 
 embedding_service = EmbeddingService()
+
+
+def get_embedding_service(model_name: Optional[str] = None) -> EmbeddingService:
+    """Factory helper to obtain an EmbeddingService instance for a specified model."""
+    return EmbeddingService(model_name=model_name)

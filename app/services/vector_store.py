@@ -7,25 +7,40 @@ from app.core.logging import logger
 
 
 class VectorStoreService:
+    _instances: Dict[str, "VectorStoreService"] = {}
     _instance: Optional["VectorStoreService"] = None
+    _collection_name: str = ""
+    _chroma_dir: str = ""
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(VectorStoreService, cls).__new__(cls)
-            cls._instance._init_chroma()
-        return cls._instance
+    def __new__(cls, collection_name: Optional[str] = None, chroma_dir: Optional[str] = None):
+        coll = collection_name or settings.DEFAULT_CHROMA_COLLECTION
+        cdir = str(Path(chroma_dir or settings.CHROMA_DIR).resolve())
+        key = f"{cdir}::{coll}"
+        if key not in cls._instances:
+            instance = super(VectorStoreService, cls).__new__(cls)
+            instance._collection_name = coll
+            instance._chroma_dir = cdir
+            instance._init_chroma(cdir, coll)
+            cls._instances[key] = instance
+            if coll == settings.DEFAULT_CHROMA_COLLECTION:
+                cls._instance = instance
+        return cls._instances[key]
 
-    def _init_chroma(self):
-        chroma_path = Path(settings.CHROMA_DIR).resolve()
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
+
+    def _init_chroma(self, chroma_path_str: str, collection_name: str):
+        chroma_path = Path(chroma_path_str).resolve()
         chroma_path.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Initializing Persistent ChromaDB client at: {chroma_path}")
+        logger.info(f"Initializing Persistent ChromaDB client at: {chroma_path} [Collection: {collection_name}]")
         
         self.client = chromadb.PersistentClient(
             path=str(chroma_path),
             settings=ChromaSettings(anonymized_telemetry=False)
         )
         self.collection = self.client.get_or_create_collection(
-            name="autosar_hld_knowledge",
+            name=collection_name,
             metadata={"hnsw:space": "cosine"}
         )
 
@@ -162,3 +177,8 @@ class VectorStoreService:
 
 
 vector_store_service = VectorStoreService()
+
+
+def get_vector_store_service(collection_name: Optional[str] = None, chroma_dir: Optional[str] = None) -> VectorStoreService:
+    """Factory helper to obtain a VectorStoreService instance for a specified collection."""
+    return VectorStoreService(collection_name=collection_name, chroma_dir=chroma_dir)

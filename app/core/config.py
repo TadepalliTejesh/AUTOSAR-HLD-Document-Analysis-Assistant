@@ -12,6 +12,9 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "AUTOSAR HLD Document Analysis Assistant"
     EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
+    EXPERIMENTAL_EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    DEFAULT_CHROMA_COLLECTION: str = "autosar_hld_knowledge"
+    EXPERIMENTAL_CHROMA_COLLECTION: str = "autosar_hld_knowledge_minilm"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.2:3b"
 

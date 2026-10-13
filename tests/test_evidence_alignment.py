@@ -717,3 +717,118 @@ def test_tautological_definition_and_layer_separation_sanitization():
     assert "microcontroller" in sanitized_layers.lower()
 
 
+def test_bsw_subdivisions_retrieval_and_minimality():
+    """
+    Regression Test:
+    Ensures question 'What are the four subdivisions of Basic Software?'
+    distinguishes architectural layer subdivisions (Page 22) from service types (Page 29),
+    and validates citation minimality by pruning Page 29 when Page 22 completely supports the 4 subdivisions.
+    """
+    chunk_p22 = {
+        "chunk_id": "doc17_p22",
+        "page": 22,
+        "section": "Coarse view",
+        "content": (
+            "Document ID 53 : AUTOSAR_EXP_LayeredSoftwareArchitecture 22\n"
+            "Complex Drivers\n"
+            "Microcontroller\n"
+            "Microcontroller Abstraction Layer\n"
+            "Services Layer\n"
+            "Application Layer\n"
+            "Runtime Environment\n"
+            "ECU Abstraction Layer\n"
+            "The AUTOSAR Basic Software is further divided in the layers: Services, ECU Abstraction, "
+            "Microcontroller Abstraction and Complex Drivers."
+        ),
+        "source_type": "text",
+        "similarity": 0.72
+    }
+    chunk_p29 = {
+        "chunk_id": "doc17_p29",
+        "page": 29,
+        "section": "Introduction to types of services",
+        "content": (
+            "Document ID 53 : AUTOSAR_EXP_LayeredSoftwareArchitecture 29\n"
+            "The Basic Software can be subdivided into the following types of services:\n"
+            "Input/Output (I/O)\n"
+            "Memory\n"
+            "Crypto\n"
+            "Communication\n"
+            "Off-board Communication\n"
+            "System"
+        ),
+        "source_type": "text",
+        "similarity": 0.72
+    }
+
+    query = "What are the four subdivisions of Basic Software?"
+    cl = classify_query(query)
+    supp, conf, _ = prune_and_rank_supporting_evidence([chunk_p22, chunk_p29], query, cl)
+
+    # Both are plausible candidates initially
+    assert any(c["page"] == 22 for c in supp)
+
+    # Grounded answer synthesis referencing the 4 layers from Page 22
+    answer = (
+        "The four subdivisions of Basic Software are:\n"
+        "1. Services\n"
+        "2. ECU Abstraction\n"
+        "3. Microcontroller Abstraction\n"
+        "4. Complex Drivers"
+    )
+    validated = validate_citations_against_answer(answer, supp, question=query)
+
+    # Citation minimality: Page 22 completely supports all 4 subdivisions, so Page 29 must be pruned
+    assert len(validated) == 1
+    assert validated[0]["page"] == 22
+
+
+def test_multi_hop_peripheral_trace_confidence_calibration():
+    """
+    Regression Test:
+    Ensures multi-hop path query with similarity < 0.72 across disconnected pages
+    is calibrated to Medium confidence rather than inappropriately inflated High confidence.
+    """
+    chunks = [
+        {"chunk_id": "c1", "page": 65, "section": "Application Layer: Sensor/Actuator Software Components", "content": "Sensor/Actuator application software component interacting with lower layers", "similarity": 0.67},
+        {"chunk_id": "c2", "page": 28, "section": "AUTOSAR Runtime Environment (RTE)", "content": "Runtime Environment communication services for software components", "similarity": 0.65},
+        {"chunk_id": "c3", "page": 25, "section": "ECU Abstraction Layer", "content": "ECU Abstraction interfaces MCAL drivers and external devices", "similarity": 0.68},
+        {"chunk_id": "c4", "page": 24, "section": "Microcontroller Abstraction Layer", "content": "MCAL internal device drivers for microcontroller peripheral access", "similarity": 0.66}
+    ]
+    query = "Trace the path from an application software component to a microcontroller peripheral."
+    cl = classify_query(query)
+    conf, metrics = evaluate_evidence_confidence(chunks, query, cl)
+
+    # Must be Medium because similarity is 0.68 (< 0.72 threshold for High) and multi-hop across distinct pages
+    assert conf == "Medium"
+
+
+def test_interface_handler_manager_comparison_precision():
+    """
+    Regression Test:
+    Ensures comparison query across interface, handler, and manager accurately retains
+    all 3 defining pages with High confidence when similarity >= 0.72.
+    """
+    chunks = [
+        {"chunk_id": "c_if", "page": 32, "section": "Interface", "content": "Interface provides generic API, does not change content of data. Located in ECU Abstraction.", "similarity": 0.77},
+        {"chunk_id": "c_hdl", "page": 33, "section": "Handler", "content": "Handler controls concurrent access to drivers, does not change content of data. In driver or interface.", "similarity": 0.76},
+        {"chunk_id": "c_mgr", "page": 34, "section": "Manager", "content": "Manager offers services for multiple clients, evaluates and changes content of data. Located in Services Layer.", "similarity": 0.76}
+    ]
+    query = "Explain the difference between an interface, handler, and manager."
+    cl = classify_query(query)
+    supp, conf, _ = prune_and_rank_supporting_evidence(chunks, query, cl)
+
+    assert len(supp) == 3
+    assert {c["page"] for c in supp} == {32, 33, 34}
+    assert conf == "High"
+
+    answer = (
+        "- Interface: Abstracts from modules below it, does not change data. Located in ECU Abstraction Layer.\n"
+        "- Handler: Controls concurrent access to drivers, does not change data.\n"
+        "- Manager: Offers services for multiple clients, evaluates and changes data content. Located in Services Layer."
+    )
+    validated = validate_citations_against_answer(answer, supp, question=query)
+    assert len(validated) == 3
+    assert {c["page"] for c in validated} == {32, 33, 34}
+
+

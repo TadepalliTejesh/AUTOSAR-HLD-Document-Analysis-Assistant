@@ -76,10 +76,19 @@ def sanitize_llm_output(raw_answer: str, supporting_chunks: List[Dict[str, Any]]
 
     # For architecture / hierarchy queries: check if major architectural entities present in evidence were missed
     if any(w in q_lower for w in ["layers of", "software layers", "layer hierarchy", "architecture layers"]):
+        if not any(w in q_lower for w in ["three highest", "3 highest", "three software layers"]):
+            chunks_text = "\n".join([c["content"].lower() for c in supporting_chunks])
+            for structural_term in ["driver", "hardware", "platform", "microcontroller"]:
+                if structural_term in chunks_text and structural_term not in cleaned.lower():
+                    logger.warning(f"Architecture layer answer missed key structural dimension '{structural_term}'. Falling back to direct grounded synthesis.")
+                    return ollama_service._direct_grounded_synthesis("", supporting_chunks, question=question)
+
+    # For path traversal / trace queries: ensure RTE is included and proper sequence is maintained
+    if any(w in q_lower for w in ["trace", "path from", "flow from"]) and any(w in q_lower for w in ["peripheral", "hardware", "microcontroller"]):
         chunks_text = "\n".join([c["content"].lower() for c in supporting_chunks])
-        for structural_term in ["driver", "hardware", "platform", "microcontroller"]:
-            if structural_term in chunks_text and structural_term not in cleaned.lower():
-                logger.warning(f"Architecture layer answer missed key structural dimension '{structural_term}'. Falling back to direct grounded synthesis.")
+        if "rte" in chunks_text or "runtime environment" in chunks_text:
+            if "rte" not in cleaned.lower() and "runtime environment" not in cleaned.lower():
+                logger.warning("Path traversal answer omitted intermediate RTE layer. Falling back to direct grounded synthesis.")
                 return ollama_service._direct_grounded_synthesis("", supporting_chunks, question=question)
 
     # For stage / progression queries: ensure prominent stages/steps from evidence are captured
@@ -138,6 +147,9 @@ def prune_supporting_evidence(
 
 
 class RAGService:
+    def __init__(self, retriever: Optional[Any] = None):
+        self.retriever = retriever or retriever_service
+
     def answer_question(
         self,
         document_id: int,
@@ -160,7 +172,7 @@ class RAGService:
         )
 
         # 1. Retrieve candidate chunks dynamically using hybrid retrieval
-        candidate_chunks, initial_conf, max_sim, explanation = retriever_service.retrieve(
+        candidate_chunks, initial_conf, max_sim, explanation = self.retriever.retrieve(
             document_id=document_id,
             query=question
         )
@@ -286,6 +298,10 @@ class RAGService:
             f"Provide a strictly grounded answer based ONLY on the context above.\n"
             f"- Answer ONLY the specific question asked. Do not discuss unrelated concepts or layers not asked about.\n"
             f"- For architecture layer or hierarchy questions: Distinguish software architecture layers (ordered top to bottom), spanning/complex drivers (if present), and the underlying hardware platform situated beneath the software layers.\n"
+            f"- For path traversal / trace questions: Trace the standard layered path from the application software component to the hardware peripheral: Application Layer (Sensor/Actuator Software Components) -> AUTOSAR Runtime Environment (RTE) -> Basic Software (ECU Abstraction Layer -> Microcontroller Abstraction Layer / MCAL) -> Microcontroller Hardware. Describe the role of intermediate layers based on the context. Clarify that peripheral interactions do not all follow an identical or strictly linear path: distinguish internal device drivers (located in MCAL accessing internal microcontroller peripherals) from external device drivers (located in ECU Abstraction accessing external peripherals), and note that Complex Drivers provide a direct access bypass from Hardware to the RTE for special timing or non-standard hardware handling.\n"
+            f"- For subdivision, classification, or categorization questions: Distinguish architectural subdivisions (e.g. software layers) from functional module categories or service types. When the question asks for a specific number of subdivisions (such as four subdivisions of Basic Software), identify the exact division that matches that count from the context (e.g. Services, ECU Abstraction, Microcontroller Abstraction, Complex Drivers), and do not conflate them with service types or conformance class tables.\n"
+            f"- For comparison questions: Systematically compare each item across role, data modification (whether it changes the data content), and architectural layer location based on the definitions in the context.\n"
+            f"- For component / layer definition questions (such as MCAL): State its position in the hierarchy (e.g. lowest software layer of Basic Software), its primary task (hardware independence), and its driver groups based on the context.\n"
             f"- For stage progression, workflow, or development approach questions: Identify the main stages or flow shown in the context before listing details.\n"
             f"- For architectural view or logical view questions: List the top-level main parts / structural tiers shown in the diagram and key functional clusters.\n"
             f"- For technical identifier or module acronym questions: State the exact full name or functional cluster indicated in the context.\n"
@@ -311,7 +327,8 @@ class RAGService:
         # Validates that every cited chunk directly supports at least one substantive claim
         validated_chunks = validate_citations_against_answer(
             answer=llm_raw_answer,
-            supporting_chunks=supporting_chunks
+            supporting_chunks=supporting_chunks,
+            question=question
         )
         if not validated_chunks:
             validated_chunks = supporting_chunks[:1]
@@ -346,9 +363,22 @@ class RAGService:
         evidence_lines = [f"- Page {c.page} — Section: {c.section}" for c in unique_citations]
         evidence_block = "\n".join(evidence_lines)
 
+        # Post-generation confidence calibration
+        ADMISSION_PATTERNS = [
+            r"(?i)\bdoes not explicitly state\b",
+            r"(?i)\bnot specified in the context\b",
+            r"(?i)\bnot mentioned in the context\b",
+            r"(?i)\bdoes not contain (?:any )?information\b",
+            r"(?i)\bis not provided in the (?:supplied )?context\b",
+            r"(?i)\bcontext does not provide\b",
+            r"(?i)\bdoes not state the purpose\b"
+        ]
+        has_admission = any(re.search(pat, llm_raw_answer) for pat in ADMISSION_PATTERNS)
+
         is_insufficient = (
             llm_raw_answer.strip().lower().startswith("insufficient evidence")
             or (len(llm_raw_answer.strip()) < 100 and "insufficient evidence" in llm_raw_answer.lower())
+            or (has_admission and len(llm_raw_answer.strip().split("\n")) <= 3)
         )
         if is_insufficient:
             confidence = "Insufficient"
@@ -363,6 +393,8 @@ class RAGService:
                 f"None"
             )
         else:
+            if has_admission:
+                confidence = "Low"
             full_formatted_answer = (
                 f"Answer:\n"
                 f"{llm_raw_answer}\n\n"

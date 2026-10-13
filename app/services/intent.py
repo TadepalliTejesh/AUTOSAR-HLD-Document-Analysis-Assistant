@@ -11,6 +11,7 @@ class QueryIntent:
     LIST_MULTI_PART = "list_multi_part"
     DEFINITION_DESCRIPTION = "definition_description"
     DEFINITION_PURPOSE = "definition_description"
+    DOCUMENT_PURPOSE = "document_purpose"
     STRUCTURE_COMPONENTS = "structure_components"
     BENEFITS = "benefits"
     MECHANISM_HOW = "mechanism_how"
@@ -219,7 +220,7 @@ def classify_query(query: str) -> Dict[str, Any]:
     )
     if not flow_match:
         flow_match = re.search(
-            r"(?:communication|data|execution|control|call)?\s*(?:path|flow|chain|stack|traversal)\s+(?:from|between)\s+(?:the\s+|an?\s+)?(.*?)\s+(?:to|and)\s+(?:the\s+|an?\s+)?(.*?)(?:\?|$|\.)",
+            r"(?:trace|follow|show|what is)?\s*(?:the\s+)?(?:communication|data|execution|control|call)?\s*(?:path|flow|chain|stack|traversal)\s+(?:from|between)\s+(?:the\s+|an?\s+)?(.*?)\s+(?:to|and)\s+(?:the\s+|an?\s+)?(.*?)(?:\?|$|\.)",
             q,
             re.IGNORECASE
         )
@@ -262,6 +263,20 @@ def classify_query(query: str) -> Dict[str, Any]:
         target = purpose_match.group(1).strip()
         target = re.sub(r"^(?:the|a|an)\s+", "", target, flags=re.IGNORECASE).strip()
         target = re.sub(r"\s+(?:in|within|for)\s+(?:the\s+)?.*$", "", target, flags=re.IGNORECASE).strip()
+
+        # Check if the query asks about the purpose of the document itself
+        is_doc_purpose = bool(
+            re.search(r"\b(?:document|doc|specification|standard)\b", q, re.IGNORECASE)
+            or target.lower().endswith("document")
+        )
+        if is_doc_purpose:
+            return {
+                "intent": QueryIntent.DOCUMENT_PURPOSE,
+                "target": target,
+                "entities": [target],
+                "search_terms": extract_search_terms(q)
+            }
+
         return {
             "intent": QueryIntent.DEFINITION_PURPOSE,
             "target": target,
