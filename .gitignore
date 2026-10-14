@@ -18,6 +18,7 @@ data/exports/*
 !data/exports/.gitkeep
 data/*.db
 data/*.sqlite
+data/*.json
 
 # Logs and OS
 *.log

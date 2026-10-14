@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+# Prevent Python from writing .pyc files and buffer stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    HF_HOME=/root/.cache/huggingface
+
+WORKDIR /app
+
+# Install system dependencies (curl for container healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch CPU first to keep image lightweight and avoid CUDA bloat
+RUN pip install --default-timeout=120 --retries=5 --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install backend dependencies
+COPY requirements-backend.txt .
+RUN pip install --default-timeout=120 --retries=5 --no-cache-dir -r requirements-backend.txt
+
+# Pre-cache default embedding model into HF_HOME for fast and offline-ready startup
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" || true
+
+# Copy application source code, tests, and test sample data
+COPY app/ ./app/
+COPY tests/ ./tests/
+COPY sample_data/ ./sample_data/
+
+# Prepare data mount point structure
+RUN mkdir -p /app/data/uploads /app/data/chroma /app/data/exports
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

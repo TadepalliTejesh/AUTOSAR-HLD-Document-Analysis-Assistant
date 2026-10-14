@@ -125,15 +125,57 @@ ollama serve
 
 ---
 
-## 🚀 Running the Application
+## 🚀 Deployment & Running the Application
 
-### Option A: One-Click Startup (PowerShell)
-To launch both the FastAPI backend and Streamlit UI in separate windows:
+### Option 1: Docker Compose (Recommended for Evaluation & Production)
+
+The entire microservice stack (Streamlit Frontend, FastAPI Backend, and Ollama LLM) can be launched with Docker Compose on Windows, Linux, or macOS.
+
+#### One-Click Docker Startup (PowerShell):
+```powershell
+.\run_docker.ps1
+```
+
+#### Manual Docker Compose Commands:
+1. **Build and launch the microservice stack:**
+   ```powershell
+   docker compose up -d
+   ```
+2. **Download the Ollama model inside the container volume:**
+   ```powershell
+   docker compose exec ollama ollama pull llama3.2:3b
+   ```
+3. **Verify running containers and health status:**
+   ```powershell
+   docker compose ps
+   ```
+4. **Access the application:**
+   - 🚗 **Streamlit Web UI:** [http://localhost:8501](http://localhost:8501)
+   - 📖 **FastAPI Swagger API Docs:** [http://localhost:8000/docs](http://localhost:8000/docs)
+   - 🩺 **System Health & Vector Metrics:** [http://localhost:8000/health](http://localhost:8000/health)
+
+5. **Run the 36-test regression suite inside the Linux backend container:**
+   ```powershell
+   docker compose exec backend pytest -s tests/
+   ```
+
+6. **Stop services:**
+   ```powershell
+   docker compose down
+   ```
+
+---
+
+### Option 2: Local Windows Development (Outside Docker)
+
+If running directly on the host machine using Python 3.11:
+
+#### One-Click Local Startup (PowerShell):
 ```powershell
 .\run_all.ps1
 ```
 
-### Option B: Manual Startup
+#### Manual Terminal Startup:
 
 **Terminal 1 — Start FastAPI Backend:**
 ```powershell
@@ -152,11 +194,37 @@ To launch both the FastAPI backend and Streamlit UI in separate windows:
 
 ## 🧪 Testing and Verification
 
-Run the comprehensive automated test suite covering PDF parsing, section chunking, vector indexing, document isolation, grounding, citations, and API endpoints:
+Run the comprehensive automated regression suite (36 tests) covering PDF parsing, section chunking, vector indexing, document isolation, grounding, citations, and API endpoints:
 
+**Inside Docker Container:**
 ```powershell
-.\.venv\Scripts\pytest -v
+docker compose exec backend pytest -s tests/
 ```
+
+**Locally on Host (PowerShell):**
+```powershell
+.\.venv\Scripts\pytest.exe -s tests/
+```
+
+---
+
+## 💾 Storage & Volume Persistence
+
+Docker Compose maps persistent volumes to ensure that no data, vectors, or model weights are lost on container restart:
+
+| Path / Volume | Type | Purpose |
+| :--- | :--- | :--- |
+| `./data:/app/data` | Bind Mount | Host SQLite database (`autosar.db`), ChromaDB vectors (`chroma/`), uploaded PDFs (`uploads/`), and exported spreadsheets (`exports/`). |
+| `autosar_ollama_data` | Named Volume | Persistent storage for downloaded Ollama model weights (`llama3.2:3b`). |
+| `autosar_hf_cache` | Named Volume | Persistent cache for SentenceTransformer embedding weights (`BAAI/bge-small-en-v1.5`). |
+
+---
+
+## 🔧 Troubleshooting & FAQ
+
+- **Port 11434 conflict on host:** The `ollama` container exposes port `11434` internally on the Docker bridge network (`http://ollama:11434`) and publishes to host port `11435` by default (`${OLLAMA_PORT:-11435}:11434`). This prevents conflicts if Ollama is already running on the Windows host.
+- **Offline / Disconnected Demo Resilience:** The backend pre-caches the `bge-small-en-v1.5` embeddings into the Docker image, and includes deterministic fallback synthesis if Ollama is offline or unavailable.
+- **Memory Footprint:** The entire stack operates comfortably within ~2.5–3.0 GB of RAM on CPU-only machines (well within WSL2 default limits).
 
 ---
 
